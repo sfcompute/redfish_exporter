@@ -1,0 +1,20 @@
+# Build from the source checkout supplied as the Docker context. The first
+# published image uses LambdaLabs/redfish_exporter v0.8.2 at its exact SHA.
+FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -buildvcs=false -o /out/redfish_exporter ./cmd/redfish-exporter
+
+# The static image includes CA roots for HTTPS Redfish endpoints. The caller
+# mounts config.yml into /etc/redfish_exporter; no sample credentials ship.
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /etc/redfish_exporter
+COPY --from=build --chown=65532:65532 /out/redfish_exporter /redfish_exporter
+EXPOSE 9610
+ENTRYPOINT ["/redfish_exporter"]

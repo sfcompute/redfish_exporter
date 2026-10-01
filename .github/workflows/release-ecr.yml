@@ -1,0 +1,164 @@
+name: Build redfish_exporter image for ECR
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish upstream v0.8.2 to ECR (build only by default)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_V082_SHA: c40a89fba445df65bb9cc8102b04b9d63120cae6
+  ECR_REPOSITORY: sfcompute/redfish-exporter
+  EXPECTED_REGISTRY: 903616605317.dkr.ecr.us-west-1.amazonaws.com
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.publish)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout image packaging
+        uses: actions/checkout@v4
+      - name: Checkout exact upstream v0.8.2 source
+        uses: actions/checkout@v4
+        with:
+          repository: LambdaLabs/redfish_exporter
+          ref: c40a89fba445df65bb9cc8102b04b9d63120cae6
+          path: source
+          persist-credentials: false
+      - name: Check source revision
+        run: test "$(git -C source rev-parse HEAD)" = "$UPSTREAM_V082_SHA"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          file: ./Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: false
+
+  publish:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: redfish-exporter-ecr-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout image packaging
+        uses: actions/checkout@v4
+      - name: Checkout exact upstream v0.8.2 source
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          repository: LambdaLabs/redfish_exporter
+          ref: c40a89fba445df65bb9cc8102b04b9d63120cae6
+          path: source
+          persist-credentials: false
+      - name: Checkout fork tag source
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha=$(git -C source rev-parse HEAD)
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$source_sha" == "$UPSTREAM_V082_SHA" ]]
+            tag=v0.8.2
+            source_url=https://github.com/LambdaLabs/redfish_exporter
+          else
+            tag=${GITHUB_REF#refs/tags/}
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            [[ "$tag" != v0.8.2 ]] || { echo 'v0.8.2 requires the pinned manual release'; exit 1; }
+            [[ "$source_sha" == "$GITHUB_SHA" ]]
+            source_url=https://github.com/$GITHUB_REPOSITORY
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "source_url=$source_url" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Verify destination and refuse an existing tag
+        shell: bash
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG: ${{ steps.release.outputs.tag }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          [[ "$REGISTRY" == "$EXPECTED_REGISTRY" ]]
+          [[ "$AWS_REGION" == us-west-1 ]]
+          # A failed AWS query is an error, never evidence that a tag is free.
+          details=$(aws ecr describe-images --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" --output json)
+          jq -e '(.imageDetails | type) == "array"' <<< "$details" > /dev/null
+          set +e
+          jq -e --arg tag "$TAG" \
+            'any(.imageDetails[]?.imageTags[]?; . == $tag)' <<< "$details" > /dev/null
+          status=$?
+          set -e
+          case "$status" in
+            0) echo "Tag $TAG already exists; refusing to overwrite it" >&2; exit 1 ;;
+            1) ;;
+            *) echo 'Could not inspect ECR image tags' >&2; exit 1 ;;
+          esac
+      - name: Build and push the release image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          file: ./Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ecr-login.outputs.registry }}/sfcompute/redfish-exporter:${{ steps.release.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ steps.release.outputs.source_url }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.source_sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+      - name: Verify digest and write release receipt
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          ecr_digest=$(aws ecr describe-images --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" --image-ids "imageTag=$TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$ecr_digest" == "$BUILD_DIGEST" ]]
+          {
+            echo '### ECR release receipt'
+            echo ''
+            echo "- Source commit: \`$SOURCE_SHA\`"
+            echo "- Tag: \`$EXPECTED_REGISTRY/$ECR_REPOSITORY:$TAG\`"
+            echo "- Digest: \`$ecr_digest\`"
+            echo "- Pull by digest: \`$EXPECTED_REGISTRY/$ECR_REPOSITORY@$ecr_digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
