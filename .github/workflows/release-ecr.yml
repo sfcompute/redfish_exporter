@@ -1,14 +1,18 @@
-name: Build redfish_exporter image for ECR
+name: Build and publish image to ECR
 
 on:
   pull_request:
-    branches: [main]
   push:
-    tags: ["v*"]
+    branches: ["**"]
+    tags: ["**"]
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Optional commit or tag in this repository (defaults to the selected ref)
+        type: string
+        required: false
       publish:
-        description: Publish upstream v0.8.2 to ECR (build only by default)
+        description: Publish the selected main commit or v* tag (build only by default)
         type: boolean
         required: false
         default: false
@@ -16,27 +20,29 @@ on:
 permissions:
   contents: read
 
+# Build records and automatic summaries can include the private registry address.
 env:
-  UPSTREAM_V082_SHA: c40a89fba445df65bb9cc8102b04b9d63120cae6
-  ECR_REPOSITORY: sfcompute/redfish-exporter
-  EXPECTED_REGISTRY: 903616605317.dkr.ecr.us-west-1.amazonaws.com
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  DOCKER_BUILD_CHECKS_ANNOTATIONS: "false"
 
 jobs:
   validate:
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.publish)
+    if: >-
+      ${{ !((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout image packaging
         uses: actions/checkout@v4
-      - name: Checkout exact upstream v0.8.2 source
+        with:
+          persist-credentials: false
+      - name: Checkout the requested source
         uses: actions/checkout@v4
         with:
-          repository: LambdaLabs/redfish_exporter
-          ref: c40a89fba445df65bb9cc8102b04b9d63120cae6
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
           path: source
           persist-credentials: false
-      - name: Check source revision
-        run: test "$(git -C source rev-parse HEAD)" = "$UPSTREAM_V082_SHA"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Build without publishing
@@ -48,59 +54,87 @@ jobs:
           push: false
 
   publish:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main')
+    if: >-
+      ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     concurrency:
-      group: redfish-exporter-ecr-${{ github.ref }}
+      group: ecr-publish-${{ github.ref }}
       cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
     steps:
       - name: Checkout image packaging
         uses: actions/checkout@v4
-      - name: Checkout exact upstream v0.8.2 source
-        if: github.event_name == 'workflow_dispatch'
+        with:
+          persist-credentials: false
+      - name: Checkout the requested source
         uses: actions/checkout@v4
         with:
-          repository: LambdaLabs/redfish_exporter
-          ref: c40a89fba445df65bb9cc8102b04b9d63120cae6
+          ref: ${{ inputs.source_ref || github.sha }}
           path: source
           persist-credentials: false
-      - name: Checkout fork tag source
-        if: github.event_name == 'push'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: source
-          persist-credentials: false
-      - name: Verify source and release tag
+      - name: Select image tag
         id: release
         shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           source_sha=$(git -C source rev-parse HEAD)
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            [[ "$source_sha" == "$UPSTREAM_V082_SHA" ]]
-            tag=v0.8.2
-            source_url=https://github.com/LambdaLabs/redfish_exporter
-          else
-            tag=${GITHUB_REF#refs/tags/}
-            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            [[ "$tag" != v0.8.2 ]] || { echo 'v0.8.2 requires the pinned manual release'; exit 1; }
-            [[ "$source_sha" == "$GITHUB_SHA" ]]
-            source_url=https://github.com/$GITHUB_REPOSITORY
+          if [[ -z "$SOURCE_REF" ]]; then
+            [[ "$source_sha" == "$GITHUB_SHA" ]] || {
+              echo 'Checked-out source does not match the triggering commit' >&2
+              exit 1
+            }
           fi
+          if [[ "$GITHUB_REF_TYPE" == tag && -z "$SOURCE_REF" ]]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=sha-$source_sha
+          fi
+          [[ "$tag" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || {
+            echo 'The Git tag is not a valid container tag' >&2
+            exit 1
+          }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "source_url=$source_url" >> "$GITHUB_OUTPUT"
+      - name: Validate and mask destination configuration
+        shell: bash
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ROLE_TO_ASSUME: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || {
+            echo 'Set the AWS_ACCOUNT_ID Actions secret' >&2
+            exit 1
+          }
+          [[ "$ROLE_TO_ASSUME" == "arn:aws:iam::$AWS_ACCOUNT_ID:role/"* ]] || {
+            echo 'Set ECR_PUSH_ROLE_ARN to a role in the configured AWS account' >&2
+            exit 1
+          }
+          [[ -n "$AWS_REGION" && -n "$ECR_REPOSITORY" ]] || {
+            echo 'Set the AWS_REGION and ECR_REPOSITORY Actions variables' >&2
+            exit 1
+          }
+          registry=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          echo "::add-mask::$AWS_ACCOUNT_ID"
+          echo "::add-mask::$ROLE_TO_ASSUME"
+          echo "::add-mask::$registry"
+          echo "ECR_REGISTRY=$registry" >> "$GITHUB_ENV"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
@@ -109,11 +143,12 @@ jobs:
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           TAG: ${{ steps.release.outputs.tag }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
-          [[ "$REGISTRY" == "$EXPECTED_REGISTRY" ]]
-          [[ "$AWS_REGION" == us-west-1 ]]
+          [[ "$REGISTRY" == "$ECR_REGISTRY" ]] || {
+            echo 'ECR login returned an unexpected registry' >&2
+            exit 1
+          }
           # A failed AWS query is an error, never evidence that a tag is free.
           details=$(aws ecr describe-images --region "$AWS_REGION" \
             --repository-name "$ECR_REPOSITORY" --output json)
@@ -128,7 +163,7 @@ jobs:
             1) ;;
             *) echo 'Could not inspect ECR image tags' >&2; exit 1 ;;
           esac
-      - name: Build and push the release image
+      - name: Build and push the image
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -136,9 +171,9 @@ jobs:
           file: ./Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.ecr-login.outputs.registry }}/sfcompute/redfish-exporter:${{ steps.release.outputs.tag }}
+          tags: ${{ env.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ steps.release.outputs.tag }}
           labels: |
-            org.opencontainers.image.source=${{ steps.release.outputs.source_url }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.release.outputs.source_sha }}
             org.opencontainers.image.version=${{ steps.release.outputs.tag }}
       - name: Verify digest and write release receipt
@@ -147,18 +182,19 @@ jobs:
           TAG: ${{ steps.release.outputs.tag }}
           SOURCE_SHA: ${{ steps.release.outputs.source_sha }}
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           set -euo pipefail
           ecr_digest=$(aws ecr describe-images --region "$AWS_REGION" \
             --repository-name "$ECR_REPOSITORY" --image-ids "imageTag=$TAG" \
             --query 'imageDetails[0].imageDigest' --output text)
-          [[ "$ecr_digest" == "$BUILD_DIGEST" ]]
+          [[ "$ecr_digest" == "$BUILD_DIGEST" ]] || {
+            echo 'ECR digest does not match the build output' >&2
+            exit 1
+          }
           {
             echo '### ECR release receipt'
             echo ''
-            echo "- Source commit: \`$SOURCE_SHA\`"
-            echo "- Tag: \`$EXPECTED_REGISTRY/$ECR_REPOSITORY:$TAG\`"
-            echo "- Digest: \`$ecr_digest\`"
-            echo "- Pull by digest: \`$EXPECTED_REGISTRY/$ECR_REPOSITORY@$ecr_digest\`"
+            echo "- Source commit: $SOURCE_SHA"
+            echo "- Image tag: $TAG"
+            echo "- Digest: $ecr_digest"
           } >> "$GITHUB_STEP_SUMMARY"
