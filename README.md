@@ -19,23 +19,34 @@ make build
 
 ### ECR image releases
 
-`Dockerfile.release` builds a static Linux binary and packages it with CA roots. It
-does not include a configuration file; mount one as
-`/etc/redfish_exporter/config.yml` (or pass `-config.file` to use another path).
+`Dockerfile.release` builds a static Linux binary and packages it with CA roots.
+Mount a config file at `/etc/redfish_exporter/config.yml` or pass `-config.file`.
 
-The [ECR workflow](./.github/workflows/release-ecr.yml) builds on pull requests
-without AWS credentials or a push. A manual run also builds only by default.
-For the first release, run it from `main` with `publish=true`: it builds the
-unmodified LambdaLabs `v0.8.2` source at commit
-`c40a89fba445df65bb9cc8102b04b9d63120cae6` and publishes only
-`903616605317.dkr.ecr.us-west-1.amazonaws.com/sfcompute/redfish-exporter:v0.8.2`.
-Later `v*` tags pushed to this fork publish their tagged source. The workflow
-refuses to overwrite an existing tag and records the source commit and ECR
-digest in the run summary. Deployments should use the digest from that receipt.
+The [ECR workflow](./.github/workflows/release-ecr.yml) builds the pushed commit,
+tagged commit, or PR head, including upstream changes merged into this fork.
+It never checks out a separate pinned upstream release.
 
-Publishing requires repository Actions variables `ECR_PUSH_ROLE_ARN` and
-`AWS_REGION` (`us-west-1`), plus an ECR push role trusted for this repository's
-`main` branch and version tags. No `latest` tag is produced.
+- Pushes to `main` publish `sha-<full-commit-sha>`; `v*` tags publish the Git tag
+  (including prereleases, provided the name is a valid container tag).
+- Other branches, other tags, and PRs build without AWS credentials or publishing.
+- Manual runs build the selected ref, or an optional `source_ref` commit/tag
+  from this repository. This also supports upstream tags that predate our
+  workflow. Run from `main` or a `v*` tag with `publish=true` to publish;
+  an explicit `source_ref` always uses `sha-<source-commit-sha>` as the image tag.
+  The role must trust the workflow's ref.
+- Before pushing, the workflow refuses tags already present in ECR, including
+  on a rerun. Use a new commit or version tag for a new image. No `latest` tag
+  is produced.
+
+Set repository Actions secrets `AWS_ACCOUNT_ID` and `ECR_PUSH_ROLE_ARN`, and
+Actions variables `AWS_REGION` and `ECR_REPOSITORY`. The role ARN must belong
+to the configured account and have push access only to the configured repository.
+The job checks the destination registry before pushing.
+
+Account-bearing values are masked in Actions logs. Automatic Docker build
+summaries and downloadable build records are disabled. The release receipt
+contains only the source commit, image tag, and verified digest; combine it with
+the privately configured registry and repository when pinning a deployment.
 
 ## Running
 

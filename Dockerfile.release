@@ -1,5 +1,4 @@
-# Build from the source checkout supplied as the Docker context. The first
-# published image uses LambdaLabs/redfish_exporter v0.8.2 at its exact SHA.
+# Build the source checkout supplied as the Docker context.
 FROM --platform=$BUILDPLATFORM golang:1.25.1-bookworm AS build
 
 ARG TARGETOS
